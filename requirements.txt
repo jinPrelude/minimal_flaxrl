@@ -1,4 +1,4 @@
-gymnasium >= 1.0.0
+gymnasium[box2d] >= 1.0.0
 numpy >= 2.0.0
 flax == 0.12.4
 jax == 0.9.0
