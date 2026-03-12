@@ -26,12 +26,12 @@ wandb login                       # for experiment logging
   - transformer model (TrXL, GTrXL)
   - harder tasks (atari, memorygym)
 
-| Algorithm | Lines | Command | Training time (MacBook Air M2) | Environment |
-|-----------|-------|---------|--------------------------------|-------------|
-| [PPO_LSTM](ppo_lstm.py) | 278 | `python ppo_lstm.py` | ~5 mins | [LunarLander-v3](ppo_lstm.py) |
-| [PPO_TrXL](ppo_trxl.py) | 669 | `python ppo_trxl.py` | 1+ hour (recommend GPU training) | [LunarLander-v3](ppo_trxl.py) |
-| [PPO_GTrXL](ppo_gtrxl.py) | 692 | `python ppo_gtrxl.py` | 1+ hour (recommend GPU training) | [LunarLander-v3](ppo_gtrxl.py), [ALE/Breakout-v5](ppo_gtrxl_atari.py), [MemoryGym](ppo_gtrxl_memorygym.py) |
-| [Impala_LSTM](impala_lstm.py) | 294 | `python impala_lstm.py` | | [LunarLander-v3](impala_lstm.py) |
+| Algorithm | Lines | Command | Environment |
+|-----------|-------|---------|-------------|
+| [PPO_LSTM](ppo_lstm.py) | 278 | `python ppo_lstm.py` | [LunarLander-v3](ppo_lstm.py) |
+| [PPO_TrXL](ppo_trxl.py) | 669 | `python ppo_trxl.py` | [LunarLander-v3](ppo_trxl.py) |
+| [PPO_GTrXL](ppo_gtrxl.py) | 692 | `python ppo_gtrxl.py`<br>`python ppo_gtrxl_atari.py`<br>`python ppo_gtrxl_memorygym.py` | [LunarLander-v3](ppo_gtrxl.py)<br>[ALE/Breakout-v5](ppo_gtrxl_atari.py)<br>[MemoryGym](ppo_gtrxl_memorygym.py) |
+| [Impala_LSTM](impala_lstm.py) | 294 | `python impala_lstm.py` | [LunarLander-v3](impala_lstm.py) |
 
 
 If you'd like to see a specific algorithm implemented, feel free to open an [issue](../../issues).
