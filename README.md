@@ -50,6 +50,11 @@ If you'd like to see a specific algorithm implemented, feel free to open an [iss
 - TrXL appears to be highly sensitive to hyperparameter tuning. For example, increasing `trxl_dim` from 128 to 256 (and `trxl-num-heads` from 2 to 4) caused training to fail.
 - In contrast, GTrXL was more stable and still trained well when increasing `trxl_dim` to 256.
 
+## References
+* Heavily Inspired by the philosophy of the [minimalrl](https://github.com/seungeunrho/minimalRL) repository.
+* The Impala implementation closely follows [cleanba](https://github.com/vwxyzjn/cleanba), with the main change being a migration from Flax Linen to Flax NNX. Their Impala design is outstanding - huge thanks to their codebase!
+
 ## Performance graph
 
 <img src="assets/performance_graph.png" width="300" />
+
