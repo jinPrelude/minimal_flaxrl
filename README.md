@@ -7,6 +7,12 @@ Single-file minimal RL implementations in [Flax NNX](https://flax.readthedocs.io
 ```bash
 pip install -r requirements.txt   # Python >= 3.12
 wandb login                       # for experiment logging
+
+# for running ppo_gtrxl_atari.py:
+pip install ale_py gymnasium[ale]
+
+# for running ppo_gtrxl_memorygym.py:
+pip install git+https://github.com/jinPrelude/endless-memory-gym.git
 ```
 
 ## Core Algorithms
