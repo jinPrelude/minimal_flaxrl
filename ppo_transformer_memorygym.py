@@ -162,9 +162,9 @@ class PPOTransformerMemoryGym(nnx.Module):
         value = self.value_head(hidden).squeeze(-1)
         return logits, value, next_state
 
-    def unroll(self, obs_seq, done_seq, init_state: TransformerState):
+    def unroll(self, obs_seq, done_seq):
         hidden = self._encode_obs(obs_seq)
-        hidden = self.backbone.unroll(jnp.swapaxes(hidden, 0, 1), jnp.swapaxes(done_seq, 0, 1), init_state)
+        hidden = self.backbone.unroll(jnp.swapaxes(hidden, 0, 1), jnp.swapaxes(done_seq, 0, 1))
         logits = jnp.swapaxes(self.policy_head(hidden), 0, 1)
         value = jnp.swapaxes(self.value_head(hidden).squeeze(-1), 0, 1)
         return logits, value
@@ -207,8 +207,8 @@ def normalize_advantages(advantages):
 
 
 def loss_fn(model, batch, clip_eps, ent_coef):
-    obs, dones, actions, old_log_probs, advantages, returns, init_state = batch
-    logits, values = model.unroll(obs, dones, init_state)
+    obs, dones, actions, old_log_probs, advantages, returns = batch
+    logits, values = model.unroll(obs, dones)
 
     logits = logits.astype(jnp.float32)
     values = values.astype(jnp.float32)
@@ -244,16 +244,13 @@ def update_ppo(model: nnx.Module, optimizer: nnx.Optimizer, minibatches, metrics
     train_minibatch((model, optimizer, metrics), minibatches)
 
 
-def make_minibatches(batch, init_state: TransformerState, env_indices, envs_per_batch: int):
+def make_minibatches(batch, env_indices, envs_per_batch: int):
     env_ids = jnp.asarray(env_indices, dtype=jnp.int32).reshape(-1, envs_per_batch)
 
     def select_time_env(x):
         return jnp.swapaxes(jnp.take(x, env_ids, axis=1), 0, 1)
 
-    return (
-        *(select_time_env(b) for b in batch),
-        jax.tree.map(lambda x: jnp.take(x, env_ids, axis=0), init_state),
-    )
+    return tuple(select_time_env(b) for b in batch)
 
 
 def parse_arguments():
@@ -368,9 +365,9 @@ def main():
     global_env_step = 0
     start_time = time.time()
     for iteration in range(args.num_iter):
+        state = model.init_state(args.num_envs)
         rollout_rewards = []
         rollout_lengths = []
-        rollout_init_state = state
 
         for _ in range(effective_context_len):
             state_for_step = reset_done_in_state(state, done)
@@ -414,7 +411,7 @@ def main():
 
         for _ in range(args.num_epochs):
             env_indices = np.asarray(jax.random.permutation(rngs(), args.num_envs))
-            minibatches = make_minibatches(train_batch, rollout_init_state, env_indices, envs_per_batch)
+            minibatches = make_minibatches(train_batch, env_indices, envs_per_batch)
             update_ppo(model, optimizer, minibatches, metrics, clip_eps=args.clip_eps, ent_coef=args.ent_coef)
 
         metric_values = {k: float(v) for k, v in metrics.compute().items()}
