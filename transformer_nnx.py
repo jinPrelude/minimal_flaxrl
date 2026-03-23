@@ -229,18 +229,6 @@ class TransformerBackbone(nnx.Module):
             self.final_norm(x_t),
         )
 
-    def _unroll_scan_reference(self, x_seq, done_seq, init_state: TransformerState):
-        def scan_step(state, inputs):
-            x_t, done_t = inputs
-            return self.step(x_t, reset_done_in_state(state, done_t))
-
-        _, hidden_seq = jax.lax.scan(
-            scan_step,
-            init_state,
-            (jnp.swapaxes(x_seq, 0, 1), jnp.swapaxes(done_seq, 0, 1)),
-        )
-        return jnp.swapaxes(hidden_seq, 0, 1)
-
     def unroll(self, x_seq, done_seq):
         """Parallel training forward pass. x_seq: [batch, seq, hidden_dim], done_seq: [batch, seq]."""
         positions, attn_mask = compute_positions_and_mask(done_seq, self.cfg.context_len)
