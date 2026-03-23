@@ -118,48 +118,56 @@ class TransformerBlock(nnx.Module):
         self.w2 = nnx.Linear(ff_dim, cfg.hidden_dim, use_bias=False, dtype=cfg.dtype, param_dtype=cfg.param_dtype, rngs=rngs)
         self.w3 = nnx.Linear(cfg.hidden_dim, ff_dim, use_bias=False, dtype=cfg.dtype, param_dtype=cfg.param_dtype, rngs=rngs)
 
-    def _project_qkv(self, x, positions):
+    def parallel(self, x, positions, mask):
+        # Attention
         B = x.shape[0]
         x_norm = self.attn_norm(x)
-        q = self.wq(x_norm).reshape(B, -1, self.n_heads, self.head_dim)
-        k = self.wk(x_norm).reshape(B, -1, self.n_heads, self.head_dim)
+        q = apply_rope(self.wq(x_norm).reshape(B, -1, self.n_heads, self.head_dim), positions, self.inv_freq)
+        k = apply_rope(self.wk(x_norm).reshape(B, -1, self.n_heads, self.head_dim), positions, self.inv_freq)
         v = self.wv(x_norm).reshape(B, -1, self.n_heads, self.head_dim)
-        q = apply_rope(q, positions, self.inv_freq)
-        k = apply_rope(k, positions, self.inv_freq)
-        return q, k, v
 
-    def _attend(self, q, k, v, mask):
-        # q/k/v: [B, S, n_heads, head_dim] -> transpose to [B, n_heads, S, head_dim]
-        q = q.transpose(0, 2, 1, 3)
-        k = k.transpose(0, 2, 1, 3)
-        v = v.transpose(0, 2, 1, 3)
+        q, k, v = q.transpose(0, 2, 1, 3), k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3)
         scale = 1.0 / jnp.sqrt(self.head_dim).astype(q.dtype)
         attn_weights = jnp.matmul(q, k.transpose(0, 1, 3, 2)) * scale
-        # mask: [B, query, key] -> [B, 1, query, key] for broadcasting over heads
         big_neg = jnp.finfo(q.dtype).min
         attn_weights = jnp.where(jnp.asarray(mask, dtype=jnp.bool_)[:, None, :, :], attn_weights, big_neg)
         attn_weights = jax.nn.softmax(attn_weights, axis=-1)
-        attn_out = jnp.matmul(attn_weights, v)  # [B, n_heads, S, head_dim]
-        attn_out = attn_out.transpose(0, 2, 1, 3).reshape(q.shape[0], -1, self.n_heads * self.head_dim)
-        return self.wo(attn_out)
+        attn_out = jnp.matmul(attn_weights, v).transpose(0, 2, 1, 3).reshape(B, -1, self.n_heads * self.head_dim)
+        h = x + self.wo(attn_out)
 
-    def _feed_forward(self, h):
+        # FFN
         ff = self.ffn_norm(h)
         return h + self.w2(jax.nn.silu(self.w1(ff)) * self.w3(ff))
 
-    def parallel(self, x, positions, mask):
-        query, key, value = self._project_qkv(x, positions)
-        h = x + self._attend(query, key, value, mask)
-        return self._feed_forward(h)
-
-    def step(self, x_t, prefix_k, prefix_v, positions, prefix_mask):
+    def step(self, x_t, cached_k, cached_v, positions, prefix_mask):
         x = x_t[:, None, :]
-        query, key, value = self._project_qkv(x, positions)
-        key_full = jnp.concatenate([prefix_k, key], axis=1)
-        value_full = jnp.concatenate([prefix_v, value], axis=1)
-        mask = jnp.concatenate([prefix_mask, jnp.ones((x.shape[0], 1), dtype=jnp.bool_)], axis=1)[:, None, :]
-        h = x + self._attend(query, key_full, value_full, mask)
-        return self._feed_forward(h)[:, 0], key[:, -1:], value[:, -1:]
+        B = x.shape[0]
+
+        # Attention with KV-cache
+        x_norm = self.attn_norm(x)
+        q = apply_rope(self.wq(x_norm).reshape(B, 1, self.n_heads, self.head_dim), positions, self.inv_freq)
+        k = apply_rope(self.wk(x_norm).reshape(B, 1, self.n_heads, self.head_dim), positions, self.inv_freq)
+        v = self.wv(x_norm).reshape(B, 1, self.n_heads, self.head_dim)
+
+        k_full = jnp.concatenate([cached_k, k], axis=1)
+        v_full = jnp.concatenate([cached_v, v], axis=1)
+        mask = jnp.concatenate([prefix_mask, jnp.ones((B, 1), dtype=jnp.bool_)], axis=1)[:, None, :]
+
+        q = q.transpose(0, 2, 1, 3)
+        k_full = k_full.transpose(0, 2, 1, 3)
+        v_full = v_full.transpose(0, 2, 1, 3)
+        scale = 1.0 / jnp.sqrt(self.head_dim).astype(q.dtype)
+        attn_weights = jnp.matmul(q, k_full.transpose(0, 1, 3, 2)) * scale
+        big_neg = jnp.finfo(q.dtype).min
+        attn_weights = jnp.where(mask[:, None, :, :], attn_weights, big_neg)
+        attn_weights = jax.nn.softmax(attn_weights, axis=-1)
+        attn_out = jnp.matmul(attn_weights, v_full).transpose(0, 2, 1, 3).reshape(B, 1, self.n_heads * self.head_dim)
+        h = x + self.wo(attn_out)
+
+        # FFN
+        ff = self.ffn_norm(h)
+        h = h + self.w2(jax.nn.silu(self.w1(ff)) * self.w3(ff))
+        return h[:, 0], k[:, -1:], v[:, -1:]
 
 
 class TransformerBackbone(nnx.Module):
