@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 from flax import struct
 import flax.nnx as nnx
-from flax.nnx.nn.attention import dot_product_attention
 import jax
 import jax.numpy as jnp
 
@@ -90,14 +89,12 @@ class TransformerBlock(nnx.Module):
         head_dim = cfg.hidden_dim // cfg.n_heads
         self.inv_freq = 1.0 / (cfg.rope_theta ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
 
-        self.attn = nnx.MultiHeadAttention(
-            num_heads=cfg.n_heads,
-            in_features=cfg.hidden_dim,
-            use_bias=False,
-            dtype=cfg.dtype,
-            param_dtype=cfg.param_dtype,
-            rngs=rngs,
-        )
+        self.n_heads = cfg.n_heads
+        self.head_dim = cfg.hidden_dim // cfg.n_heads
+        self.wq = nnx.Linear(cfg.hidden_dim, cfg.hidden_dim, use_bias=False, dtype=cfg.dtype, param_dtype=cfg.param_dtype, rngs=rngs)
+        self.wk = nnx.Linear(cfg.hidden_dim, cfg.hidden_dim, use_bias=False, dtype=cfg.dtype, param_dtype=cfg.param_dtype, rngs=rngs)
+        self.wv = nnx.Linear(cfg.hidden_dim, cfg.hidden_dim, use_bias=False, dtype=cfg.dtype, param_dtype=cfg.param_dtype, rngs=rngs)
+        self.wo = nnx.Linear(cfg.hidden_dim, cfg.hidden_dim, use_bias=False, dtype=cfg.dtype, param_dtype=cfg.param_dtype, rngs=rngs)
         self.attn_norm = nnx.RMSNorm(
             num_features=cfg.hidden_dim,
             epsilon=cfg.norm_eps,
@@ -122,23 +119,29 @@ class TransformerBlock(nnx.Module):
         self.w3 = nnx.Linear(cfg.hidden_dim, ff_dim, use_bias=False, dtype=cfg.dtype, param_dtype=cfg.param_dtype, rngs=rngs)
 
     def _project_qkv(self, x, positions):
+        B = x.shape[0]
         x_norm = self.attn_norm(x)
-        query = apply_rope(self.attn.query(x_norm), positions, self.inv_freq)
-        key = apply_rope(self.attn.key(x_norm), positions, self.inv_freq)
-        value = self.attn.value(x_norm)
-        return query, key, value
+        q = self.wq(x_norm).reshape(B, -1, self.n_heads, self.head_dim)
+        k = self.wk(x_norm).reshape(B, -1, self.n_heads, self.head_dim)
+        v = self.wv(x_norm).reshape(B, -1, self.n_heads, self.head_dim)
+        q = apply_rope(q, positions, self.inv_freq)
+        k = apply_rope(k, positions, self.inv_freq)
+        return q, k, v
 
-    def _attend(self, query, key, value, mask):
-        attn_out = dot_product_attention(
-            query,
-            key,
-            value,
-            mask=jnp.asarray(mask, dtype=jnp.bool_)[:, None, :, :],
-            deterministic=True,
-            dtype=self.attn.dtype,
-            precision=self.attn.precision,
-        )
-        return self.attn.out(attn_out)
+    def _attend(self, q, k, v, mask):
+        # q/k/v: [B, S, n_heads, head_dim] -> transpose to [B, n_heads, S, head_dim]
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+        scale = 1.0 / jnp.sqrt(self.head_dim).astype(q.dtype)
+        attn_weights = jnp.matmul(q, k.transpose(0, 1, 3, 2)) * scale
+        # mask: [B, query, key] -> [B, 1, query, key] for broadcasting over heads
+        big_neg = jnp.finfo(q.dtype).min
+        attn_weights = jnp.where(jnp.asarray(mask, dtype=jnp.bool_)[:, None, :, :], attn_weights, big_neg)
+        attn_weights = jax.nn.softmax(attn_weights, axis=-1)
+        attn_out = jnp.matmul(attn_weights, v)  # [B, n_heads, S, head_dim]
+        attn_out = attn_out.transpose(0, 2, 1, 3).reshape(q.shape[0], -1, self.n_heads * self.head_dim)
+        return self.wo(attn_out)
 
     def _feed_forward(self, h):
         ff = self.ffn_norm(h)
