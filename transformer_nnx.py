@@ -64,32 +64,23 @@ def apply_rope(x, positions, inv_freq):
     return out.reshape(x.shape).astype(x_dtype)
 
 
-def build_parallel_unroll_metadata(done_seq, init_state: TransformerState, context_len: int):
+def build_parallel_unroll_metadata(done_seq, context_len: int):
     done = jnp.asarray(done_seq, dtype=jnp.bool_)
     batch_size, seq_len = done.shape
 
     t = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
-    c = jnp.arange(context_len, dtype=jnp.int32)[None, :]
-    init_pos = init_state.pos.astype(jnp.int32)
-    init_valid_len = jnp.minimum(init_state.valid_len.astype(jnp.int32), context_len)
 
     episode_ids = jnp.cumsum(done.astype(jnp.int32), axis=1)
     reset_points = jnp.where(done, jnp.broadcast_to(t, (batch_size, seq_len)), -jnp.ones((batch_size, seq_len), dtype=jnp.int32))
     last_reset = jnp.maximum.accumulate(reset_points, axis=1)
-    query_pos = jnp.where(episode_ids == 0, init_pos[:, None] + t, t - last_reset)
+    # First episode: position starts from 0 at rollout start
+    # Subsequent episodes: position resets to 0 at each done
+    query_pos = jnp.where(episode_ids == 0, t, t - last_reset)
 
-    prefix_valid = c >= (context_len - init_valid_len[:, None])
-    prefix_episode_ids = jnp.where(prefix_valid, jnp.zeros_like(c), -jnp.ones_like(c))
-    prefix_pos = init_pos[:, None] + c - context_len
-    prefix_pos = jnp.where(prefix_valid, prefix_pos, jnp.full_like(prefix_pos, -1_000_000_000))
-
-    key_episode_ids = jnp.concatenate([prefix_episode_ids, episode_ids], axis=1)
-    key_pos = jnp.concatenate([prefix_pos, query_pos], axis=1)
-    query_pos_expanded = query_pos[:, :, None]
     attn_mask = (
-        (key_episode_ids[:, None, :] == episode_ids[:, :, None])
-        & (key_pos[:, None, :] <= query_pos_expanded)
-        & (key_pos[:, None, :] >= query_pos_expanded - (context_len - 1))
+        (episode_ids[:, None, :] == episode_ids[:, :, None])
+        & (query_pos[:, None, :] <= query_pos[:, :, None])
+        & (query_pos[:, None, :] >= query_pos[:, :, None] - (context_len - 1))
     )
     return query_pos, attn_mask
 
@@ -153,10 +144,8 @@ class TransformerBlock(nnx.Module):
         ff = self.ffn_norm(h)
         return h + self.w2(jax.nn.silu(self.w1(ff)) * self.w3(ff))
 
-    def parallel(self, x, prefix_k, prefix_v, positions, mask):
+    def parallel(self, x, positions, mask):
         query, key, value = self._project_qkv(x, positions)
-        key = jnp.concatenate([prefix_k, key], axis=1)
-        value = jnp.concatenate([prefix_v, value], axis=1)
         h = x + self._attend(query, key, value, mask)
         return self._feed_forward(h)
 
@@ -239,11 +228,11 @@ class TransformerBackbone(nnx.Module):
         )
         return jnp.swapaxes(hidden_seq, 0, 1)
 
-    def unroll(self, x_seq, done_seq, init_state: TransformerState):
+    def unroll(self, x_seq, done_seq):
         """Parallel training forward pass. x_seq: [batch, seq, hidden_dim], done_seq: [batch, seq]."""
-        positions, attn_mask = build_parallel_unroll_metadata(done_seq, init_state, self.cfg.context_len)
+        positions, attn_mask = build_parallel_unroll_metadata(done_seq, self.cfg.context_len)
         x = x_seq
-        for layer_idx, layer in enumerate(self.layers):
-            x = layer.parallel(x, init_state.k_cache[:, layer_idx], init_state.v_cache[:, layer_idx], positions, attn_mask)
+        for layer in self.layers:
+            x = layer.parallel(x, positions, attn_mask)
         return self.final_norm(x)
 
