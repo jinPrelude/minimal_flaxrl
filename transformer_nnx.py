@@ -197,13 +197,14 @@ class TransformerBackbone(nnx.Module):
         )
 
     def step(self, x_t, state: TransformerState):
+        # prefix_len entries are valid in the cache; prefix_mask marks which positions are valid
         prefix_len = jnp.minimum(state.valid_len, self.cfg.context_len - 1)
         prefix_idx = jnp.arange(self.cfg.context_len, dtype=jnp.int32)[None, :]
-        prefix_mask = prefix_idx >= (self.cfg.context_len - prefix_len[:, None])
+        prefix_mask = prefix_idx >= (self.cfg.context_len - prefix_len[:, None])  # most recent prefix_len entries are valid
         positions = state.pos[:, None]
 
-        k_cache = state.k_cache
-        v_cache = state.v_cache
+        # Each layer reads from original cache, collects new k/v into lists
+        k_list, v_list = [], []
         for layer_idx, layer in enumerate(self.layers):
             x_t, k_new, v_new = layer.step(
                 x_t,
@@ -214,13 +215,13 @@ class TransformerBackbone(nnx.Module):
             )
             merged_k = jnp.concatenate([state.k_cache[:, layer_idx], k_new], axis=1)
             merged_v = jnp.concatenate([state.v_cache[:, layer_idx], v_new], axis=1)
-            k_cache = k_cache.at[:, layer_idx].set(merged_k[:, -self.cfg.context_len :])
-            v_cache = v_cache.at[:, layer_idx].set(merged_v[:, -self.cfg.context_len :])
+            k_list.append(merged_k[:, -self.cfg.context_len:])
+            v_list.append(merged_v[:, -self.cfg.context_len:])
 
         return (
             TransformerState(
-                k_cache=k_cache,
-                v_cache=v_cache,
+                k_cache=jnp.stack(k_list, axis=1),
+                v_cache=jnp.stack(v_list, axis=1),
                 valid_len=jnp.minimum(state.valid_len + 1, self.cfg.context_len),
                 pos=state.pos + 1,
             ),
