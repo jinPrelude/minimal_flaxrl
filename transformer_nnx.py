@@ -63,7 +63,7 @@ def apply_rope(x, positions, inv_freq):
     return out.reshape(x.shape).astype(x_dtype)
 
 
-def build_parallel_unroll_metadata(done_seq, context_len: int):
+def compute_positions_and_mask(done_seq, context_len: int):
     done = jnp.asarray(done_seq, dtype=jnp.bool_)
     batch_size, seq_len = done.shape
 
@@ -76,11 +76,12 @@ def build_parallel_unroll_metadata(done_seq, context_len: int):
     # Subsequent episodes: position resets to 0 at each done
     query_pos = jnp.where(episode_ids == 0, t, t - last_reset)
 
-    attn_mask = (
-        (episode_ids[:, None, :] == episode_ids[:, :, None])
-        & (query_pos[:, None, :] <= query_pos[:, :, None])
-        & (query_pos[:, None, :] >= query_pos[:, :, None] - (context_len - 1))
-    )
+    # mask shape: [B, query_pos, key_pos]
+    same_episode = (episode_ids[:, None, :] == episode_ids[:, :, None])
+    causal = (query_pos[:, None, :] <= query_pos[:, :, None])
+    within_context = (query_pos[:, None, :] >= query_pos[:, :, None] - (context_len - 1))
+    attn_mask = same_episode & causal & within_context
+
     return query_pos, attn_mask
 
 
@@ -242,7 +243,7 @@ class TransformerBackbone(nnx.Module):
 
     def unroll(self, x_seq, done_seq):
         """Parallel training forward pass. x_seq: [batch, seq, hidden_dim], done_seq: [batch, seq]."""
-        positions, attn_mask = build_parallel_unroll_metadata(done_seq, self.cfg.context_len)
+        positions, attn_mask = compute_positions_and_mask(done_seq, self.cfg.context_len)
         x = x_seq
         for layer in self.layers:
             x = layer.parallel(x, positions, attn_mask)
