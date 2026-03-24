@@ -11,7 +11,7 @@ os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
 
 import flax.nnx as nnx
 import gymnasium as gym
-import memory_gym  # noqa: F401
+import popgym  # noqa: F401
 import jax
 import jax.numpy as jnp
 import jax.scipy.special
@@ -25,8 +25,7 @@ from transformer_nnx import TransformerBackbone, TransformerConfig, TransformerS
 
 
 MODEL_DTYPE = jnp.bfloat16
-PARAM_DTYPE = jnp.bfloat16
-SUPPORTED_ENVS = {"MortarMayhem-Grid-v0", "MysteryPath-Grid-v0"}
+PARAM_DTYPE = jnp.float32
 
 
 @struct.dataclass
@@ -84,7 +83,7 @@ class ReplayBuffer:
     def __init__(self, num_steps: int, num_envs: int, obs_shape):
         self.num_steps = num_steps
         self.num_envs = num_envs
-        self.obs = np.zeros((num_steps, num_envs, *obs_shape), dtype=np.uint8)
+        self.obs = np.zeros((num_steps, num_envs, *obs_shape), dtype=np.float32)
         self.actions = np.zeros((num_steps, num_envs), dtype=np.int32)
         self.log_probs = np.zeros((num_steps, num_envs), dtype=np.float32)
         self.rewards = np.zeros((num_steps, num_envs), dtype=np.float32)
@@ -99,7 +98,7 @@ class ReplayBuffer:
         if self.size >= self.num_steps:
             raise ValueError("ReplayBuffer is full. Call reset() before adding new data.")
         t = self.size
-        self.obs[t] = np.asarray(obs, dtype=np.uint8)
+        self.obs[t] = np.asarray(obs, dtype=np.float32)
         self.actions[t] = np.asarray(actions, dtype=np.int32)
         self.log_probs[t] = np.asarray(log_probs, dtype=np.float32)
         self.rewards[t] = np.asarray(rewards, dtype=np.float32)
@@ -120,63 +119,24 @@ class ReplayBuffer:
         )
 
 
-class PPOTransformerMemoryGymV2(nnx.Module):
+class PPOTransformerPopGymV2(nnx.Module):
     def __init__(
         self,
-        obs_shape: tuple[int, int, int],
+        obs_dim: int,
         num_actions: int,
         transformer_cfg: TransformerConfig,
         critic: CategoricalCritic,
         *,
         rngs: nnx.Rngs,
     ):
-        if len(obs_shape) != 3:
-            raise ValueError(f"`obs_shape` must be rank-3 HWC image shape, got {obs_shape}")
-
-        self.obs_shape = obs_shape
         self.transformer_cfg = transformer_cfg
         self.critic = critic
 
-        self.conv1 = nnx.Conv(
-            in_features=obs_shape[-1],
-            out_features=32,
-            kernel_size=(8, 8),
-            strides=(4, 4),
-            padding="VALID",
-            dtype=MODEL_DTYPE,
-            param_dtype=PARAM_DTYPE,
-            rngs=rngs,
-        )
-        self.conv2 = nnx.Conv(
-            in_features=32,
-            out_features=64,
-            kernel_size=(4, 4),
-            strides=(2, 2),
-            padding="VALID",
-            dtype=MODEL_DTYPE,
-            param_dtype=PARAM_DTYPE,
-            rngs=rngs,
-        )
-        self.conv3 = nnx.Conv(
-            in_features=64,
-            out_features=64,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding="VALID",
-            dtype=MODEL_DTYPE,
-            param_dtype=PARAM_DTYPE,
-            rngs=rngs,
-        )
-
-        dummy = jnp.zeros((1, *obs_shape), dtype=MODEL_DTYPE)
-        dummy = nnx.relu(self.conv1(dummy))
-        dummy = nnx.relu(self.conv2(dummy))
-        dummy = nnx.relu(self.conv3(dummy))
         self.encoder = nnx.Linear(
-            int(np.prod(dummy.shape[1:])),
+            obs_dim,
             transformer_cfg.hidden_dim,
-            dtype=transformer_cfg.dtype,
-            param_dtype=transformer_cfg.param_dtype,
+            dtype=MODEL_DTYPE,
+            param_dtype=PARAM_DTYPE,
             rngs=rngs,
         )
         self.backbone = TransformerBackbone(transformer_cfg, rngs=rngs)
@@ -196,23 +156,7 @@ class PPOTransformerMemoryGymV2(nnx.Module):
         )
 
     def _encode_obs(self, obs):
-        x = jnp.asarray(obs, dtype=MODEL_DTYPE) / jnp.asarray(255.0, dtype=MODEL_DTYPE)
-        if x.ndim == 4:
-            x = nnx.relu(self.conv1(x))
-            x = nnx.relu(self.conv2(x))
-            x = nnx.relu(self.conv3(x))
-            x = x.reshape((x.shape[0], -1))
-            return nnx.relu(self.encoder(x))
-        if x.ndim == 5:
-            t, b = x.shape[:2]
-            x = x.reshape((t * b, *self.obs_shape))
-            x = nnx.relu(self.conv1(x))
-            x = nnx.relu(self.conv2(x))
-            x = nnx.relu(self.conv3(x))
-            x = x.reshape((t * b, -1))
-            x = nnx.relu(self.encoder(x))
-            return x.reshape((t, b, -1))
-        raise ValueError(f"`obs` must be rank-4 or rank-5 image batch, got shape={x.shape}")
+        return nnx.relu(self.encoder(jnp.asarray(obs, dtype=MODEL_DTYPE)))
 
     def init_state(self, batch_size: int) -> TransformerState:
         return self.backbone.init_state(batch_size, dtype=self.transformer_cfg.dtype)
@@ -320,8 +264,7 @@ def make_minibatches(batch, env_indices, envs_per_batch: int):
 
 def parse_arguments():
     parser = ArgumentParser()
-    parser.add_argument("--env-name", type=str, default="MortarMayhem-Grid-v0")
-    parser.add_argument("--render-mode", type=str, default="debug_rgb_array")
+    parser.add_argument("--env-name", type=str, default="popgym-RepeatPreviousHard-v0")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-iter", type=int, default=100000)
     parser.add_argument("--context-len", type=int, default=128)
@@ -344,15 +287,13 @@ def parse_arguments():
     parser.add_argument("--rope-theta", type=float, default=500000.0)
 
     parser.add_argument("--critic-num-bins", type=int, default=101)
-    parser.add_argument("--critic-value-min", type=float, default=0.0)
+    parser.add_argument("--critic-value-min", type=float, default=-1.0)
     parser.add_argument("--critic-value-max", type=float, default=1.0)
     parser.add_argument("--critic-sigma", type=float, default=None)
     return parser.parse_args()
 
 
 def validate_args(args):
-    if args.env_name not in SUPPORTED_ENVS:
-        raise ValueError(f"Unsupported env_name {args.env_name}. Supported: {sorted(SUPPORTED_ENVS)}")
     if args.context_len < 1:
         raise ValueError(f"context_len must be >= 1, got {args.context_len}")
     if args.num_minibatch < 1:
@@ -382,31 +323,36 @@ def main():
         args.env_name,
         num_envs=args.num_envs,
         vectorization_mode="sync",
-        render_mode=args.render_mode,
     )
     envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
 
     obs_space = envs.single_observation_space
     act_space = envs.single_action_space
-    if not isinstance(obs_space, gym.spaces.Box):
-        raise ValueError(f"Only Box observation space is supported, got {obs_space}")
-    if len(obs_space.shape) != 3:
-        raise ValueError(f"Observation must be HWC image shape, got {obs_space.shape}")
-    if obs_space.dtype != np.uint8:
-        raise ValueError(f"Observation dtype must be uint8 image, got {obs_space.dtype}")
+    if isinstance(obs_space, gym.spaces.Discrete):
+        obs_dim = obs_space.n
+        obs_is_discrete = True
+    elif isinstance(obs_space, gym.spaces.Box) and len(obs_space.shape) == 1:
+        obs_dim = obs_space.shape[0]
+        obs_is_discrete = False
+    else:
+        raise ValueError(f"Only 1D Box or Discrete observation space supported, got {obs_space}")
     if not isinstance(act_space, gym.spaces.Discrete):
         raise ValueError(f"Only Discrete action space is supported, got {act_space}")
 
-    vector_env = envs.env if hasattr(envs, "env") else envs
-    vector_env.envs[0].reset(seed=args.seed)
-    max_episode_steps = int(vector_env.envs[0].get_wrapper_attr("max_episode_steps"))
-    if max_episode_steps <= 0:
-        max_episode_steps = args.context_len
-    effective_context_len = min(args.context_len, max_episode_steps)
+    def preprocess_obs(obs):
+        if obs_is_discrete:
+            return np.eye(obs_dim, dtype=np.float32)[obs]
+        return np.asarray(obs, dtype=np.float32)
+
+    max_episode_steps = getattr(envs.spec, "max_episode_steps", None)
+    if max_episode_steps is None or max_episode_steps <= 0:
+        vector_env = envs.env if hasattr(envs, "env") else envs
+        max_episode_steps = getattr(vector_env.envs[0].unwrapped, "max_episode_length", args.context_len)
+    effective_context_len = max(args.context_len, max_episode_steps)
 
     rngs = nnx.Rngs(args.seed)
-    model = PPOTransformerMemoryGymV2(
-        obs_shape=obs_space.shape,
+    model = PPOTransformerPopGymV2(
+        obs_dim=obs_dim,
         num_actions=act_space.n,
         transformer_cfg=TransformerConfig(
             hidden_dim=args.hidden_dim,
@@ -444,7 +390,7 @@ def main():
 
     wandb.init(
         project="minimal-flaxrl",
-        name=f"ppo_transformer_memorygym_v2_{args.env_name}",
+        name=f"ppo_transformer_popgym_v2_{args.env_name}",
         config={
             **vars(args),
             "requested_context_len": args.context_len,
@@ -453,15 +399,15 @@ def main():
         },
     )
 
-    obs, _ = envs.reset(seed=args.seed)
-    state = model.init_state(args.num_envs)
-    done = np.zeros(args.num_envs, dtype=np.float32)
-    replay_buffer = ReplayBuffer(effective_context_len, args.num_envs, obs_space.shape)
+    replay_buffer = ReplayBuffer(effective_context_len, args.num_envs, (obs_dim,))
 
     global_env_step = 0
     start_time = time.time()
     for iteration in range(args.num_iter):
+        obs, _ = envs.reset(seed=args.seed + iteration)
+        obs = preprocess_obs(obs)
         state = model.init_state(args.num_envs)
+        done = np.zeros(args.num_envs, dtype=np.float32)
         rollout_rewards = []
         rollout_lengths = []
 
@@ -481,7 +427,7 @@ def main():
                         rollout_rewards.append(float(info["episode"]["r"][idx]))
                         rollout_lengths.append(int(info["episode"]["l"][idx]))
 
-            obs = next_obs
+            obs = preprocess_obs(next_obs)
             done = next_done
 
         obs_batch, actions_batch, log_probs_batch, rewards_batch, dones_batch, values_batch = replay_buffer.get()

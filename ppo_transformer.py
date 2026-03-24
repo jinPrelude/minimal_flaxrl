@@ -15,6 +15,10 @@ import wandb
 from transformer_nnx import TransformerBackbone, TransformerConfig, TransformerState, reset_done_in_state
 
 
+MODEL_DTYPE = jnp.float32
+PARAM_DTYPE = jnp.float32
+
+
 class ReplayBuffer:
     def __init__(self, num_steps: int, num_envs: int, obs_shape):
         self.num_steps = num_steps
@@ -165,6 +169,7 @@ def parse_arguments():
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--lmbda", type=float, default=0.97)
     parser.add_argument("--learning-rate", type=float, default=0.0005)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--clip-eps", type=float, default=0.2)
     parser.add_argument("--ent-coef", type=float, default=0.001)
 
@@ -220,7 +225,14 @@ def main():
         ),
         rngs=rngs,
     )
-    optimizer = nnx.Optimizer(model, optax.adamw(args.learning_rate), wrt=nnx.Param)
+    optimizer = nnx.Optimizer(
+        model,
+        optax.chain(
+            optax.clip_by_global_norm(args.max_grad_norm),
+            optax.adamw(args.learning_rate),
+        ),
+        wrt=nnx.Param,
+    )
     metrics = nnx.metrics.MultiMetric(
         actor_loss=nnx.metrics.Average("actor_loss"),
         critic_loss=nnx.metrics.Average("critic_loss"),
@@ -233,14 +245,13 @@ def main():
         config=vars(args),
     )
 
-    obs, _ = envs.reset(seed=args.seed)
-    state = model.init_state(args.num_envs)
-    done = np.zeros(args.num_envs, dtype=np.float32)
     replay_buffer = ReplayBuffer(args.context_len, args.num_envs, envs.single_observation_space.shape)
 
     global_env_step = 0
     for iteration in range(args.num_iter):
+        obs, _ = envs.reset(seed=args.seed + iteration)
         state = model.init_state(args.num_envs)
+        done = np.zeros(args.num_envs, dtype=np.float32)
         rollout_rewards = []
         rollout_lengths = []
 

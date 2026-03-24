@@ -14,17 +14,70 @@ import gymnasium as gym
 import memory_gym  # noqa: F401
 import jax
 import jax.numpy as jnp
+import jax.scipy.special
 import numpy as np
 import optax
 import rlax
 import wandb
+from flax import struct
 
 from transformer_nnx import TransformerBackbone, TransformerConfig, TransformerState, reset_done_in_state
 
 
 MODEL_DTYPE = jnp.bfloat16
-PARAM_DTYPE = jnp.bfloat16
+PARAM_DTYPE = jnp.float32
 SUPPORTED_ENVS = {"MortarMayhem-Grid-v0", "MysteryPath-Grid-v0"}
+
+
+@struct.dataclass
+class CriticPrediction:
+    logits: jax.Array
+    value: jax.Array
+
+
+@struct.dataclass
+class CategoricalCritic:
+    num_bins: int
+    value_min: float
+    value_max: float
+    sigma: float
+
+    @property
+    def output_dim(self):
+        return self.num_bins
+
+    @property
+    def bin_width(self):
+        return (self.value_max - self.value_min) / self.num_bins
+
+    @property
+    def bin_edges(self):
+        return jnp.linspace(self.value_min, self.value_max, self.num_bins + 1, dtype=jnp.float32)
+
+    @property
+    def bin_centers(self):
+        edges = self.bin_edges
+        return 0.5 * (edges[:-1] + edges[1:])
+
+    def decode(self, logits):
+        probs = jax.nn.softmax(logits, axis=-1)
+        centers = self.bin_centers.astype(logits.dtype)
+        return jnp.sum(probs * centers, axis=-1)
+
+    def predict(self, logits):
+        return CriticPrediction(logits=logits, value=self.decode(logits))
+
+    def target_probs(self, target):
+        target = jnp.clip(target, self.value_min, self.value_max)
+        support = self.bin_edges.astype(target.dtype)
+        cdf = jax.scipy.special.erf((support - target[..., None]) / (jnp.sqrt(2.0) * self.sigma))
+        mass = cdf[..., 1:] - cdf[..., :-1]
+        return mass / (cdf[..., -1] - cdf[..., 0])[..., None]
+
+    def loss(self, prediction, target_value):
+        target_probs = jax.lax.stop_gradient(self.target_probs(target_value))
+        log_probs = jax.nn.log_softmax(prediction.logits, axis=-1)
+        return -(target_probs * log_probs).sum(axis=-1).mean()
 
 
 class ReplayBuffer:
@@ -67,13 +120,22 @@ class ReplayBuffer:
         )
 
 
-class PPOTransformerMemoryGym(nnx.Module):
-    def __init__(self, obs_shape: tuple[int, int, int], num_actions: int, transformer_cfg: TransformerConfig, *, rngs: nnx.Rngs):
+class PPOTransformerMemoryGymV2(nnx.Module):
+    def __init__(
+        self,
+        obs_shape: tuple[int, int, int],
+        num_actions: int,
+        transformer_cfg: TransformerConfig,
+        critic: CategoricalCritic,
+        *,
+        rngs: nnx.Rngs,
+    ):
         if len(obs_shape) != 3:
             raise ValueError(f"`obs_shape` must be rank-3 HWC image shape, got {obs_shape}")
 
         self.obs_shape = obs_shape
         self.transformer_cfg = transformer_cfg
+        self.critic = critic
 
         self.conv1 = nnx.Conv(
             in_features=obs_shape[-1],
@@ -125,9 +187,9 @@ class PPOTransformerMemoryGym(nnx.Module):
             param_dtype=transformer_cfg.param_dtype,
             rngs=rngs,
         )
-        self.value_head = nnx.Linear(
+        self.critic_head = nnx.Linear(
             transformer_cfg.hidden_dim,
-            1,
+            critic.output_dim,
             dtype=transformer_cfg.dtype,
             param_dtype=transformer_cfg.param_dtype,
             rngs=rngs,
@@ -159,22 +221,22 @@ class PPOTransformerMemoryGym(nnx.Module):
         hidden = self._encode_obs(obs)
         next_state, hidden = self.backbone.step(hidden, state)
         logits = self.policy_head(hidden)
-        value = self.value_head(hidden).squeeze(-1)
-        return logits, value, next_state
+        critic = self.critic.predict(self.critic_head(hidden))
+        return logits, critic, next_state
 
     def unroll(self, obs_seq, done_seq):
         hidden = self._encode_obs(obs_seq)
         hidden = self.backbone.unroll(jnp.swapaxes(hidden, 0, 1), jnp.swapaxes(done_seq, 0, 1))
         logits = jnp.swapaxes(self.policy_head(hidden), 0, 1)
-        value = jnp.swapaxes(self.value_head(hidden).squeeze(-1), 0, 1)
-        return logits, value
+        critic_logits = jnp.swapaxes(self.critic_head(hidden), 0, 1)
+        return logits, self.critic.predict(critic_logits)
 
 
 @nnx.jit
 def sample_action(model, obs, state, rngs):
-    logits, value, next_state = model.step(obs, state)
+    logits, critic, next_state = model.step(obs, state)
     logits = logits.astype(jnp.float32)
-    value = value.astype(jnp.float32)
+    value = critic.value.astype(jnp.float32)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     actions = rngs.categorical(logits, axis=-1)
     sampled_log_prob = jnp.take_along_axis(log_probs, actions[..., None], axis=-1).squeeze(-1)
@@ -183,8 +245,8 @@ def sample_action(model, obs, state, rngs):
 
 @nnx.jit
 def bootstrap_value(model, obs, state):
-    _, value, _ = model.step(obs, state)
-    return value.astype(jnp.float32)
+    _, critic, _ = model.step(obs, state)
+    return critic.value.astype(jnp.float32)
 
 
 def calculate_gae(rewards, values, dones, next_value, next_done, gamma: float, lmbda: float):
@@ -208,10 +270,13 @@ def normalize_advantages(advantages):
 
 def loss_fn(model, batch, clip_eps, ent_coef):
     obs, dones, actions, old_log_probs, advantages, returns = batch
-    logits, values = model.unroll(obs, dones)
+    logits, critic = model.unroll(obs, dones)
 
     logits = logits.astype(jnp.float32)
-    values = values.astype(jnp.float32)
+    critic = CriticPrediction(
+        logits=critic.logits.astype(jnp.float32),
+        value=critic.value.astype(jnp.float32),
+    )
     old_log_probs = old_log_probs.astype(jnp.float32)
     advantages = advantages.astype(jnp.float32)
     returns = returns.astype(jnp.float32)
@@ -223,7 +288,7 @@ def loss_fn(model, batch, clip_eps, ent_coef):
     ratio = jnp.exp(selected_log_probs - old_log_probs)
 
     actor_loss = rlax.clipped_surrogate_pg_loss(ratio.reshape(-1), advantages.reshape(-1), clip_eps).mean()
-    critic_loss = optax.huber_loss(values, jax.lax.stop_gradient(returns)).mean()
+    critic_loss = model.critic.loss(critic, returns)
     entropy = -jnp.sum(jax.nn.softmax(logits, axis=-1) * log_probs, axis=-1).mean()
     total_loss = actor_loss + 0.5 * critic_loss - ent_coef * entropy
     return total_loss, (actor_loss, critic_loss, entropy)
@@ -260,14 +325,15 @@ def parse_arguments():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-iter", type=int, default=100000)
     parser.add_argument("--context-len", type=int, default=128)
-    parser.add_argument("--num-envs", type=int, default=32)
-    parser.add_argument("--num-minibatch", type=int, default=1)
+    parser.add_argument("--num-envs", type=int, default=128)
+    parser.add_argument("--num-minibatch", type=int, default=4)
     parser.add_argument("--num-epochs", type=int, default=3)
     parser.add_argument("--gamma", type=float, default=0.995)
     parser.add_argument("--lmbda", type=float, default=0.95)
     parser.add_argument("--learning-rate", type=float, default=2.5e-4)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--clip-eps", type=float, default=0.1)
-    parser.add_argument("--ent-coef", type=float, default=1e-4)
+    parser.add_argument("--ent-coef", type=float, default=1e-2)
 
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--n-layers", type=int, default=4)
@@ -276,6 +342,11 @@ def parse_arguments():
     parser.add_argument("--ffn-dim-multiplier", type=float, default=None)
     parser.add_argument("--norm-eps", type=float, default=1e-5)
     parser.add_argument("--rope-theta", type=float, default=500000.0)
+
+    parser.add_argument("--critic-num-bins", type=int, default=101)
+    parser.add_argument("--critic-value-min", type=float, default=0.0)
+    parser.add_argument("--critic-value-max", type=float, default=1.0)
+    parser.add_argument("--critic-sigma", type=float, default=None)
     return parser.parse_args()
 
 
@@ -288,6 +359,18 @@ def validate_args(args):
         raise ValueError(f"num_minibatch must be >= 1, got {args.num_minibatch}")
     if args.num_envs % args.num_minibatch != 0:
         raise ValueError(f"num_envs must be divisible by num_minibatch, got {args.num_envs}, {args.num_minibatch}")
+    if args.critic_num_bins < 2:
+        raise ValueError(f"critic_num_bins must be >= 2, got {args.critic_num_bins}")
+    if args.max_grad_norm <= 0.0:
+        raise ValueError(f"max_grad_norm must be > 0, got {args.max_grad_norm}")
+    if args.critic_value_min >= args.critic_value_max:
+        raise ValueError(
+            f"critic_value_min must be < critic_value_max, got {args.critic_value_min} and {args.critic_value_max}"
+        )
+    if args.critic_sigma is None:
+        args.critic_sigma = 0.75 * ((args.critic_value_max - args.critic_value_min) / args.critic_num_bins)
+    if args.critic_sigma <= 0.0:
+        raise ValueError(f"critic_sigma must be > 0, got {args.critic_sigma}")
 
 
 def main():
@@ -322,7 +405,7 @@ def main():
     effective_context_len = min(args.context_len, max_episode_steps)
 
     rngs = nnx.Rngs(args.seed)
-    model = PPOTransformerMemoryGym(
+    model = PPOTransformerMemoryGymV2(
         obs_shape=obs_space.shape,
         num_actions=act_space.n,
         transformer_cfg=TransformerConfig(
@@ -337,9 +420,22 @@ def main():
             dtype=MODEL_DTYPE,
             param_dtype=PARAM_DTYPE,
         ),
+        critic=CategoricalCritic(
+            num_bins=args.critic_num_bins,
+            value_min=args.critic_value_min,
+            value_max=args.critic_value_max,
+            sigma=args.critic_sigma,
+        ),
         rngs=rngs,
     )
-    optimizer = nnx.Optimizer(model, optax.adamw(args.learning_rate), wrt=nnx.Param)
+    optimizer = nnx.Optimizer(
+        model,
+        optax.chain(
+            optax.clip_by_global_norm(args.max_grad_norm),
+            optax.adamw(args.learning_rate),
+        ),
+        wrt=nnx.Param,
+    )
     metrics = nnx.metrics.MultiMetric(
         actor_loss=nnx.metrics.Average("actor_loss"),
         critic_loss=nnx.metrics.Average("critic_loss"),
@@ -348,7 +444,7 @@ def main():
 
     wandb.init(
         project="minimal-flaxrl",
-        name=f"ppo_transformer_memorygym_{args.env_name}",
+        name=f"ppo_transformer_memorygym_v2_{args.env_name}",
         config={
             **vars(args),
             "requested_context_len": args.context_len,
@@ -357,15 +453,14 @@ def main():
         },
     )
 
-    obs, _ = envs.reset(seed=args.seed)
-    state = model.init_state(args.num_envs)
-    done = np.zeros(args.num_envs, dtype=np.float32)
     replay_buffer = ReplayBuffer(effective_context_len, args.num_envs, obs_space.shape)
 
     global_env_step = 0
     start_time = time.time()
     for iteration in range(args.num_iter):
+        obs, _ = envs.reset(seed=args.seed + iteration)
         state = model.init_state(args.num_envs)
+        done = np.zeros(args.num_envs, dtype=np.float32)
         rollout_rewards = []
         rollout_lengths = []
 
