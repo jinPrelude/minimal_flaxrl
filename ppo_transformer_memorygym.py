@@ -26,7 +26,7 @@ from transformer_nnx import TransformerBackbone, TransformerConfig, TransformerS
 
 MODEL_DTYPE = jnp.bfloat16
 PARAM_DTYPE = jnp.float32
-SUPPORTED_ENVS = {"MortarMayhem-Grid-v0", "MysteryPath-Grid-v0"}
+SUPPORTED_ENVS = {"MortarMayhem-Grid-v0", "MysteryPath-Grid-v0", "Endless-MysteryPath-v0"}
 
 
 @struct.dataclass
@@ -320,14 +320,14 @@ def make_minibatches(batch, env_indices, envs_per_batch: int):
 
 def parse_arguments():
     parser = ArgumentParser()
-    parser.add_argument("--env-name", type=str, default="MortarMayhem-Grid-v0")
+    parser.add_argument("--env-name", type=str, default="Endless-MysteryPath-v0")
     parser.add_argument("--render-mode", type=str, default="debug_rgb_array")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-iter", type=int, default=100000)
     parser.add_argument("--context-len", type=int, default=128)
-    parser.add_argument("--num-envs", type=int, default=128)
+    parser.add_argument("--num-envs", type=int, default=256)
     parser.add_argument("--num-minibatch", type=int, default=4)
-    parser.add_argument("--num-epochs", type=int, default=3)
+    parser.add_argument("--num-epochs", type=int, default=2)
     parser.add_argument("--gamma", type=float, default=0.995)
     parser.add_argument("--lmbda", type=float, default=0.95)
     parser.add_argument("--learning-rate", type=float, default=2.5e-4)
@@ -345,7 +345,7 @@ def parse_arguments():
 
     parser.add_argument("--critic-num-bins", type=int, default=101)
     parser.add_argument("--critic-value-min", type=float, default=0.0)
-    parser.add_argument("--critic-value-max", type=float, default=1.0)
+    parser.add_argument("--critic-value-max", type=float, default=13.0)
     parser.add_argument("--critic-sigma", type=float, default=None)
     return parser.parse_args()
 
@@ -381,7 +381,7 @@ def main():
     envs = gym.make_vec(
         args.env_name,
         num_envs=args.num_envs,
-        vectorization_mode="sync",
+        vectorization_mode="async",
         render_mode=args.render_mode,
     )
     envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
@@ -397,12 +397,8 @@ def main():
     if not isinstance(act_space, gym.spaces.Discrete):
         raise ValueError(f"Only Discrete action space is supported, got {act_space}")
 
-    vector_env = envs.env if hasattr(envs, "env") else envs
-    vector_env.envs[0].reset(seed=args.seed)
-    max_episode_steps = int(vector_env.envs[0].get_wrapper_attr("max_episode_steps"))
-    if max_episode_steps <= 0:
-        max_episode_steps = args.context_len
-    effective_context_len = min(args.context_len, max_episode_steps)
+    max_episode_steps = gym.spec(args.env_name).max_episode_steps
+    effective_context_len = min(args.context_len, max_episode_steps) if max_episode_steps else args.context_len
 
     rngs = nnx.Rngs(args.seed)
     model = PPOTransformerMemoryGymV2(
@@ -458,7 +454,7 @@ def main():
     global_env_step = 0
     start_time = time.time()
     for iteration in range(args.num_iter):
-        obs, _ = envs.reset(seed=args.seed + iteration)
+        obs, _ = envs.reset(seed=args.seed + iteration * args.num_envs)
         state = model.init_state(args.num_envs)
         done = np.zeros(args.num_envs, dtype=np.float32)
         rollout_rewards = []

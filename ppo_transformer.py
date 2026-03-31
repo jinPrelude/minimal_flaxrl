@@ -249,7 +249,7 @@ def main():
 
     global_env_step = 0
     for iteration in range(args.num_iter):
-        obs, _ = envs.reset(seed=args.seed + iteration)
+        obs, _ = envs.reset(seed=args.seed + iteration * args.num_envs)
         state = model.init_state(args.num_envs)
         done = np.zeros(args.num_envs, dtype=np.float32)
         rollout_rewards = []
